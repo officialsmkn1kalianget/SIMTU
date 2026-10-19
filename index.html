@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIM TU</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- Loading Overlay -->
+  <div id="loadingOverlay" class="loading-overlay">
+    <div class="spinner-border text-primary" role="status"><span class="visually-hidden">Memuat...</span></div>
+    <p class="mt-3">Memuat SIM TU...</p>
+  </div>
+
+  <!-- ============== HALAMAN LOGIN ============== -->
+  <div id="authScreen" class="auth-screen" style="display:none;">
+    <div class="auth-card">
+      <div class="auth-logo"><i class="bi bi-mortarboard-fill"></i></div>
+      <h4 class="mb-1" id="authAppTitle">SIM TU</h4>
+      <p class="text-secondary mb-4" id="authAppSub">Sistem Informasi Manajemen Staf TU</p>
+
+      <ul class="nav nav-pills auth-tabs mb-4" id="authTabs">
+        <li class="nav-item flex-fill"><button class="nav-link active w-100" data-role="staf" onclick="switchAuthTab('staf')">Staf TU</button></li>
+        <li class="nav-item flex-fill"><button class="nav-link w-100" data-role="admin" onclick="switchAuthTab('admin')">Admin / Kepala TU</button></li>
+      </ul>
+
+      <!-- Form Staf -->
+      <form id="formLoginStaf" onsubmit="handleLoginStaf(event)">
+        <div class="mb-3 text-start">
+          <label class="form-label">NIP</label>
+          <input type="text" class="form-control" id="nipInput" placeholder="Masukkan NIP Anda" required>
+          <div class="form-text">NIP digunakan sebagai username sekaligus password.</div>
+        </div>
+        <button type="submit" class="btn btn-primary w-100 btn-auth">
+          <i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf
+        </button>
+      </form>
+
+      <!-- Form Admin -->
+      <form id="formLoginAdmin" onsubmit="handleLoginAdmin(event)" style="display:none;">
+        <div class="mb-3 text-start">
+          <label class="form-label">Username</label>
+          <input type="text" class="form-control" id="adminUser" required>
+        </div>
+        <div class="mb-3 text-start">
+          <label class="form-label">Password</label>
+          <input type="password" class="form-control" id="adminPass" required>
+        </div>
+        <button type="submit" class="btn btn-primary w-100 btn-auth">
+          <i class="bi bi-shield-lock"></i> Masuk sebagai Admin
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============== SHELL STAF (Mobile) ============== -->
+  <div id="stafShell" class="staf-shell" style="display:none;">
+    <header class="staf-topbar">
+      <div>
+        <strong id="stafAppName">SIM TU</strong>
+        <div class="small text-secondary">Sistem Kehadiran &amp; Laporan</div>
+      </div>
+      <button class="icon-btn" onclick="toggleDarkMode()"><i class="bi bi-moon-stars"></i></button>
+    </header>
+
+    <main class="staf-main" id="stafMain">
+      <section id="staf-section-presensi" class="staf-section active"></section>
+      <section id="staf-section-laporan" class="staf-section"></section>
+      <section id="staf-section-izin" class="staf-section"></section>
+      <section id="staf-section-profil" class="staf-section"></section>
+    </main>
+
+    <nav class="staf-bottomnav">
+      <button class="bn-item active" data-section="presensi" onclick="navigateStaf('presensi')"><i class="bi bi-person-check"></i><span>Presensi</span></button>
+      <button class="bn-item" data-section="laporan" onclick="navigateStaf('laporan')"><i class="bi bi-camera"></i><span>Laporan</span></button>
+      <button class="bn-item" data-section="izin" onclick="navigateStaf('izin')"><i class="bi bi-file-earmark-text"></i><span>Izin</span></button>
+      <button class="bn-item" data-section="profil" onclick="navigateStaf('profil')"><i class="bi bi-person"></i><span>Profil</span></button>
+    </nav>
+  </div>
+
+  <!-- ============== SHELL ADMIN (Desktop) ============== -->
+  <div id="adminShell" class="admin-shell" style="display:none;">
+    <nav id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <i class="bi bi-mortarboard-fill fs-3"></i>
+        <div>
+          <h6 class="mb-0" id="adminAppName">SIM TU</h6>
+          <small id="adminSchoolName" class="text-secondary"></small>
+        </div>
+      </div>
+      <ul class="sidebar-nav">
+        <li><a href="#" class="nav-link active" data-section="dashboard" onclick="navigateAdmin('dashboard')"><i class="bi bi-speedometer2"></i><span>Monitoring Dashboard</span></a></li>
+        <li><a href="#" class="nav-link" data-section="validasi" onclick="navigateAdmin('validasi')"><i class="bi bi-patch-check"></i><span>Validasi Izin</span> <span id="badgeIzin" class="badge-count" style="display:none;"></span></a></li>
+        <li><a href="#" class="nav-link" data-section="masterStaf" onclick="navigateAdmin('masterStaf')"><i class="bi bi-people"></i><span>Data Master Staf</span></a></li>
+        <li><a href="#" class="nav-link" data-section="cetak" onclick="navigateAdmin('cetak')"><i class="bi bi-printer"></i><span>Laporan Staf TU</span></a></li>
+        <li><a href="#" class="nav-link" data-section="pengaturan" onclick="navigateAdmin('pengaturan')"><i class="bi bi-gear"></i><span>Pengaturan Sistem</span></a></li>
+      </ul>
+      <div class="sidebar-footer">
+        <div class="form-check form-switch mb-2">
+          <input class="form-check-input" type="checkbox" id="darkModeToggleAdmin" onchange="toggleDarkMode()">
+          <label class="form-check-label" for="darkModeToggleAdmin"><i class="bi bi-moon-stars"></i> Mode Gelap</label>
+        </div>
+        <a href="javascript:void(0)" onclick="handleLogout()" class="nav-link text-danger"><i class="bi bi-box-arrow-left"></i> Keluar</a>
+      </div>
+    </nav>
+
+    <main class="admin-main">
+      <div class="admin-topbar d-flex d-lg-none">
+        <button class="btn btn-link" onclick="toggleSidebar()"><i class="bi bi-list fs-4"></i></button>
+        <h6 class="mb-0" id="adminPageTitle">Dashboard</h6>
+      </div>
+      <div id="section-dashboard" class="admin-section active"></div>
+      <div id="section-validasi" class="admin-section"></div>
+      <div id="section-masterStaf" class="admin-section"></div>
+      <div id="section-cetak" class="admin-section"></div>
+      <div id="section-pengaturan" class="admin-section"></div>
+    </main>
+  </div>
+
+  <!-- Modal Preview Foto -->
+  <div class="modal fade" id="previewModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="previewTitle">Pratinjau Foto</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body text-center"><div id="previewContent"></div></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-lg"></i> Tutup</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Konfirmasi -->
+  <div class="modal fade" id="confirmModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="confirmTitle">Konfirmasi</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body" id="confirmBody">Apakah Anda yakin?</div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-danger" id="confirmActionBtn">Ya, Lanjutkan</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast-container position-fixed bottom-0 end-0 p-3" style="z-index:2000;">
+    <div id="appToast" class="toast" role="alert">
+      <div class="toast-header">
+        <strong class="me-auto" id="toastTitle">Notifikasi</strong>
+        <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+      </div>
+      <div class="toast-body" id="toastBody"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+
+  <script src="js/config.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
