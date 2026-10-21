@@ -1,79 +1,175 @@
 // ============================================================
-// SIM TU — Logika Aplikasi (Frontend)
-// Diadaptasi dari versi HtmlService: seluruh pemanggilan
-// google.script.run sudah diganti fungsi dari api.js (fetch-based).
-// Pastikan config.js (GAS_URL) dan api.js dimuat SEBELUM file ini.
+// SIM TU — Logika Aplikasi (Frontend) — Instant UX Edition
+// Menerapkan gas-instant-ux:
+//  1) SPA murni — navigasi antar menu TIDAK fetch ke server,
+//     render langsung dari AppState (cache di memori).
+//  2) Optimistic UI — aksi (kirim laporan, validasi izin, CRUD
+//     staf) langsung update tampilan, sinkron server di belakang.
+//  3) Cache lokal (localStorage) — buka app lagi = instan
+//     (stale-while-revalidate), lalu disegarkan diam-diam.
+//  4) Bootstrap gabungan — satu panggilan server saat login,
+//     bukan fetch terpisah di setiap menu.
 // ============================================================
 
-// ════════════════════════════════════════════════════════
-// STATE GLOBAL
-// ════════════════════════════════════════════════════════
 const AppState = {
-  role: null,          // 'staf' | 'admin'
-  user: null,          // objek staf / admin aktif
-  config: {},
-  riwayatHariIni: [],
+  role: null, user: null, config: {},
+  dataStafCache: [], dataIzinCache: [], laporanHariIniCache: [],
+  riwayatHariIni: [], riwayatIzinStaf: [],
+  dashboardCache: null,
+  rekapCache: [],
   fotoCapture: { base64: null, mime: null, fileName: null },
   gpsCapture: { lat: null, lng: null, valid: false, jarak: null },
   izinFoto: { base64: null, mime: null, fileName: null },
-  chartInstances: {},
-  dataStafCache: [],
-  dataIzinCache: [],
-  rekapCache: []
+  chartInstances: {}
 };
 
 const HARI_ID = ['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'];
+const BOOTSTRAP_MAX_AGE_MS = 30 * 60 * 1000; // cache lokal dianggap usang setelah 30 menit
 
 // ════════════════════════════════════════════════════════
-// INISIALISASI
+// INISIALISASI — stale-while-revalidate
 // ════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
   const savedTheme = localStorage.getItem('simtu_theme') || 'light';
   document.documentElement.setAttribute('data-theme', savedTheme);
-  document.getElementById('darkModeToggleAdmin') && (document.getElementById('darkModeToggleAdmin').checked = savedTheme === 'dark');
+  const darkChk = document.getElementById('darkModeToggleAdmin');
+  if (darkChk) darkChk.checked = savedTheme === 'dark';
 
-  getAllConfig()
-    .then(res => {
-      document.getElementById('loadingOverlay').style.display = 'none';
+  const savedSession = JSON.parse(localStorage.getItem('simtu_session') || 'null');
 
-      if (!res) {
-        showAuthScreen();
-        showToast('Perhatian', 'Backend mengembalikan respons kosong (null). Cek: (1) tidak ada file "Code.gs" default yang tersisa selain "Kode", (2) jalankan setupAppEnvironment() lalu Deploy ulang (New Version).', 'danger');
-        return;
-      }
+  if (!savedSession) {
+    document.getElementById('loadingOverlay').style.display = 'none';
+    showAuthScreen();
+    // Ambil nama sekolah untuk layar login — tidak blocking, gagal pun tidak masalah.
+    getAllConfig().then(res => {
+      if (res && res.success) { AppState.config = res.data; updateAuthBranding(); }
+    }).catch(() => {});
+    return;
+  }
 
-      if (res.success) AppState.config = res.data;
-      else showToast('Perhatian', res.message || 'Konfigurasi belum siap. Jalankan setupAppEnvironment() terlebih dahulu.', 'warning');
+  AppState.role = savedSession.role;
+  AppState.user = savedSession.user;
 
-      const savedSession = JSON.parse(localStorage.getItem('simtu_session') || 'null');
-      if (savedSession) {
-        AppState.role = savedSession.role;
-        AppState.user = savedSession.user;
+  // 1) Render INSTAN dari cache lokal dulu kalau ada (tidak nunggu server).
+  const cacheKey = getBootstrapCacheKey();
+  const cached = loadBootstrapFromLocalStorage(cacheKey);
+  if (cached) {
+    applyBootstrapToState(cached);
+    document.getElementById('loadingOverlay').style.display = 'none';
+    enterApp();
+  }
+
+  // 2) Selalu ambil data segar di belakang layar.
+  fetchBootstrap(
+    data => {
+      applyBootstrapToState(data);
+      saveBootstrapToLocalStorage(cacheKey, data);
+      if (!cached) {
+        document.getElementById('loadingOverlay').style.display = 'none';
         enterApp();
       } else {
-        showAuthScreen();
+        refreshCurrentSectionSilently();
       }
-    })
-    .catch(err => {
-      document.getElementById('loadingOverlay').style.display = 'none';
-      showAuthScreen();
-      showToast('Perhatian', 'Gagal memuat konfigurasi: ' + err.message + '. Jalankan setupAppEnvironment() terlebih dahulu.', 'danger');
-    });
+    },
+    err => {
+      if (!cached) {
+        document.getElementById('loadingOverlay').style.display = 'none';
+        showAuthScreen();
+        showToast('Perhatian', 'Gagal memuat data dari server: ' + (err && err.message ? err.message : 'Respons kosong.'), 'danger');
+      }
+      // Kalau ada cache lama, biarkan user tetap pakai versi lama — jangan ganggu.
+    }
+  );
 });
+
+function updateAuthBranding() {
+  if (AppState.config.namaSekolah) document.getElementById('authAppSub').textContent = AppState.config.namaSekolah;
+}
 
 function showAuthScreen() {
   document.getElementById('authScreen').style.display = 'flex';
   document.getElementById('stafShell').style.display = 'none';
   document.getElementById('adminShell').style.display = 'none';
-  if (AppState.config.namaSekolah) {
-    document.getElementById('authAppSub').textContent = AppState.config.namaSekolah;
-  }
+  updateAuthBranding();
 }
 
 function switchAuthTab(role) {
   document.querySelectorAll('#authTabs .nav-link').forEach(b => b.classList.toggle('active', b.dataset.role === role));
   document.getElementById('formLoginStaf').style.display = role === 'staf' ? 'block' : 'none';
   document.getElementById('formLoginAdmin').style.display = role === 'admin' ? 'block' : 'none';
+}
+
+// ════════════════════════════════════════════════════════
+// BOOTSTRAP — satu panggilan, semua data awal (Prinsip 1 & 4)
+// ════════════════════════════════════════════════════════
+function getBootstrapCacheKey() {
+  return 'simtu_bootstrap_' + AppState.role + (AppState.role === 'staf' ? '_' + AppState.user.NIP : '');
+}
+
+function saveBootstrapToLocalStorage(key, data) {
+  try { localStorage.setItem(key, JSON.stringify({ data, savedAt: Date.now() })); } catch (e) { /* kuota penuh, abaikan */ }
+}
+
+function loadBootstrapFromLocalStorage(key) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!raw || (Date.now() - raw.savedAt) > BOOTSTRAP_MAX_AGE_MS) return null;
+    return raw.data;
+  } catch (e) { return null; }
+}
+
+function fetchBootstrap(onSuccess, onError) {
+  const call = AppState.role === 'admin' ? getBootstrapAdmin() : getBootstrapStaf(AppState.user.NIP);
+  call.then(res => {
+    if (res && res.success) onSuccess(res.data);
+    else onError && onError(res);
+  }).catch(err => onError && onError(err));
+}
+
+function applyBootstrapToState(data) {
+  AppState.config = data.config || AppState.config;
+  if (AppState.role === 'admin') {
+    AppState.dataStafCache = data.staf || [];
+    AppState.dataIzinCache = data.izin || [];
+    AppState.dashboardCache = data.dashboard || null;
+    AppState.laporanHariIniCache = data.laporanHariIni || [];
+    if (!AppState.rekapCache.length) AppState.rekapCache = data.laporanHariIni || [];
+  } else {
+    AppState.riwayatHariIni = data.riwayatHariIni || [];
+    AppState.riwayatIzinStaf = data.riwayatIzin || [];
+  }
+}
+
+function persistCurrentCache() {
+  const key = getBootstrapCacheKey();
+  const data = AppState.role === 'admin'
+    ? { config: AppState.config, staf: AppState.dataStafCache, izin: AppState.dataIzinCache, dashboard: AppState.dashboardCache, laporanHariIni: AppState.laporanHariIniCache }
+    : { config: AppState.config, riwayatHariIni: AppState.riwayatHariIni, riwayatIzin: AppState.riwayatIzinStaf };
+  saveBootstrapToLocalStorage(key, data);
+}
+
+// Update section yang sedang aktif tanpa ganggu form yang lagi diisi user.
+function refreshCurrentSectionSilently() {
+  if (AppState.role === 'staf') {
+    const active = document.querySelector('.staf-section.active');
+    if (!active) return;
+    const id = active.id.replace('staf-section-', '');
+    if (id === 'laporan') return; // jangan ganggu form kamera yang sedang diisi
+    if (id === 'presensi') renderStafPresensi();
+    else if (id === 'izin') renderStafIzin();
+    else if (id === 'profil') renderStafProfil();
+  } else {
+    const active = document.querySelector('.admin-section.active');
+    if (!active) return;
+    const id = active.id.replace('section-', '');
+    const formStaf = document.getElementById('formStafContainer');
+    if (formStaf && formStaf.innerHTML.trim()) return; // form tambah/edit staf sedang terbuka
+    if (id === 'dashboard') renderAdminDashboard();
+    else if (id === 'validasi') renderAdminValidasi();
+    else if (id === 'masterStaf') renderAdminMasterStaf();
+    else if (id === 'cetak') renderAdminCetak();
+    // 'pengaturan' sengaja dilewati — jangan timpa input yang sedang diedit user
+  }
 }
 
 // ════════════════════════════════════════════════════════
@@ -86,16 +182,16 @@ function handleLoginStaf(e) {
   setBtnLoading(btn, 'Memeriksa...');
   loginStaf(nip)
     .then(res => {
-      resetBtn(btn, '<i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf');
-      if (!res) { showToast('Gagal Masuk', 'Respons kosong dari server.', 'danger'); return; }
-      if (res.success) {
-        AppState.role = 'staf';
-        AppState.user = res.data;
-        localStorage.setItem('simtu_session', JSON.stringify({ role: 'staf', user: res.data }));
-        enterApp();
-      } else {
-        showToast('Gagal Masuk', res.message, 'danger');
-      }
+      if (!res) { resetBtn(btn, '<i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf'); showToast('Gagal Masuk', 'Respons kosong dari server.', 'danger'); return; }
+      if (!res.success) { resetBtn(btn, '<i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf'); showToast('Gagal Masuk', res.message, 'danger'); return; }
+      AppState.role = 'staf';
+      AppState.user = res.data;
+      localStorage.setItem('simtu_session', JSON.stringify({ role: 'staf', user: res.data }));
+      setBtnLoading(btn, 'Menyiapkan data...');
+      fetchBootstrap(
+        data => { applyBootstrapToState(data); saveBootstrapToLocalStorage(getBootstrapCacheKey(), data); enterApp(); },
+        err => { resetBtn(btn, '<i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf'); showToast('Gagal', 'Gagal memuat data awal: ' + (err && err.message ? err.message : ''), 'danger'); }
+      );
     })
     .catch(err => { resetBtn(btn, '<i class="bi bi-box-arrow-in-right"></i> Masuk sebagai Staf'); showToast('Error', err.message, 'danger'); });
 }
@@ -108,16 +204,16 @@ function handleLoginAdmin(e) {
   setBtnLoading(btn, 'Memeriksa...');
   loginAdmin(u, p)
     .then(res => {
-      resetBtn(btn, '<i class="bi bi-shield-lock"></i> Masuk sebagai Admin');
-      if (!res) { showToast('Gagal Masuk', 'Respons kosong dari server.', 'danger'); return; }
-      if (res.success) {
-        AppState.role = 'admin';
-        AppState.user = res.data;
-        localStorage.setItem('simtu_session', JSON.stringify({ role: 'admin', user: res.data }));
-        enterApp();
-      } else {
-        showToast('Gagal Masuk', res.message, 'danger');
-      }
+      if (!res) { resetBtn(btn, '<i class="bi bi-shield-lock"></i> Masuk sebagai Admin'); showToast('Gagal Masuk', 'Respons kosong dari server.', 'danger'); return; }
+      if (!res.success) { resetBtn(btn, '<i class="bi bi-shield-lock"></i> Masuk sebagai Admin'); showToast('Gagal Masuk', res.message, 'danger'); return; }
+      AppState.role = 'admin';
+      AppState.user = res.data;
+      localStorage.setItem('simtu_session', JSON.stringify({ role: 'admin', user: res.data }));
+      setBtnLoading(btn, 'Menyiapkan data...');
+      fetchBootstrap(
+        data => { applyBootstrapToState(data); saveBootstrapToLocalStorage(getBootstrapCacheKey(), data); enterApp(); },
+        err => { resetBtn(btn, '<i class="bi bi-shield-lock"></i> Masuk sebagai Admin'); showToast('Gagal', 'Gagal memuat data awal: ' + (err && err.message ? err.message : ''), 'danger'); }
+      );
     })
     .catch(err => { resetBtn(btn, '<i class="bi bi-shield-lock"></i> Masuk sebagai Admin'); showToast('Error', err.message, 'danger'); });
 }
@@ -132,7 +228,6 @@ function handleLogout() {
 
 function enterApp() {
   document.getElementById('authScreen').style.display = 'none';
-  const nama = AppState.config.namaSekolah || 'SIM TU';
   if (AppState.role === 'staf') {
     document.getElementById('stafShell').style.display = 'flex';
     document.getElementById('adminShell').style.display = 'none';
@@ -140,7 +235,7 @@ function enterApp() {
   } else {
     document.getElementById('adminShell').style.display = 'flex';
     document.getElementById('stafShell').style.display = 'none';
-    document.getElementById('adminSchoolName').textContent = nama;
+    document.getElementById('adminSchoolName').textContent = AppState.config.namaSekolah || '';
     navigateAdmin('dashboard');
   }
 }
@@ -206,21 +301,13 @@ function getJadwalSesiHariIni() {
   const now = new Date();
   const isJumat = now.getDay() === 5;
   const cfg = AppState.config || {};
-  const d = (v, fb) => (v ? v : fb); // fallback jika config belum termuat dari server
+  const d = (v, fb) => (v ? v : fb);
   const semua = [
     { sesi: 1, mulai: d(cfg.sesi1Mulai, '06:00'), selesai: d(cfg.sesi1Selesai, '10:00'), label: 'Sesi 1: Presensi Pagi' },
     { sesi: 2, mulai: d(cfg.sesi2Mulai, '10:30'), selesai: d(cfg.sesi2Selesai, '12:30'), label: 'Sesi 2: Progres Siang' },
     { sesi: 3, mulai: d(cfg.sesi3Mulai, '13:00'), selesai: d(cfg.sesi3Selesai, '16:00'), label: 'Sesi 3: Laporan Akhir' }
   ];
   return isJumat ? semua.slice(0, 2) : semua;
-}
-
-// Pastikan AppState.config selalu yang terbaru dari server sebelum render
-// (dipakai terutama oleh halaman Pengaturan agar tidak tampil kosong).
-function refreshConfigThenRender(callback) {
-  getAllConfig()
-    .then(res => { if (res && res.success) AppState.config = res.data; callback(); })
-    .catch(x => { callback(); });
 }
 
 function waktuKeMenit(hhmm) { const [h, m] = (hhmm || '0:0').split(':').map(Number); return h * 60 + m; }
@@ -237,7 +324,7 @@ function statusSesiSaatIni(sesi) {
 }
 
 // ════════════════════════════════════════════════════════
-// NAVIGASI STAF
+// NAVIGASI STAF — INSTAN, render dari AppState (tanpa fetch)
 // ════════════════════════════════════════════════════════
 function navigateStaf(section) {
   document.querySelectorAll('.staf-section').forEach(s => s.classList.remove('active'));
@@ -250,54 +337,45 @@ function navigateStaf(section) {
   else if (section === 'profil') renderStafProfil();
 }
 
-function loadRiwayatHariIni(callback) {
-  getRiwayatLaporanHariIni(AppState.user.NIP)
-    .then(res => { AppState.riwayatHariIni = res.success ? res.data : []; callback(); })
-    .catch(x => { AppState.riwayatHariIni = []; callback(); });
-}
-
 function renderStafPresensi() {
   const el = document.getElementById('staf-section-presensi');
-  el.innerHTML = `<div class="text-center py-4"><div class="spinner-border text-primary"></div></div>`;
-  loadRiwayatHariIni(() => {
-    const jadwal = getJadwalSesiHariIni();
-    const now = new Date();
-    const hariLabel = HARI_ID[now.getDay()] + ', ' + formatTanggalIndo(now.toISOString().slice(0,10));
+  const jadwal = getJadwalSesiHariIni();
+  const now = new Date();
+  const hariLabel = HARI_ID[now.getDay()] + ', ' + formatTanggalIndo(now.toISOString().slice(0, 10));
 
-    let cardsHtml = jadwal.map(s => {
-      const st = statusSesiSaatIni(s);
-      const cls = st === 'selesai' ? 'done-session' : st === 'aktif' ? 'active-session' : 'locked-session';
-      const pill = st === 'selesai' ? '<span class="status-pill status-success"><i class="bi bi-check-circle"></i> Sudah Lapor</span>'
-        : st === 'aktif' ? '<span class="status-pill status-warning"><i class="bi bi-clock"></i> Sesi Aktif</span>'
-        : st === 'lewat' ? '<span class="status-pill status-danger"><i class="bi bi-x-circle"></i> Terlewat</span>'
-        : '<span class="status-pill" style="background:var(--border-color);color:var(--text-secondary);"><i class="bi bi-lock"></i> Belum Dibuka</span>';
-      return `
-        <div class="card-simtu session-card ${cls}">
-          <div class="d-flex justify-content-between align-items-start">
-            <div>
-              <strong>${s.label}</strong>
-              <div class="small text-muted-simtu">${s.mulai} - ${s.selesai} WIB</div>
-            </div>
-            ${pill}
+  const cardsHtml = jadwal.map(s => {
+    const st = statusSesiSaatIni(s);
+    const cls = st === 'selesai' ? 'done-session' : st === 'aktif' ? 'active-session' : 'locked-session';
+    const pill = st === 'selesai' ? '<span class="status-pill status-success"><i class="bi bi-check-circle"></i> Sudah Lapor</span>'
+      : st === 'aktif' ? '<span class="status-pill status-warning"><i class="bi bi-clock"></i> Sesi Aktif</span>'
+      : st === 'lewat' ? '<span class="status-pill status-danger"><i class="bi bi-x-circle"></i> Terlewat</span>'
+      : '<span class="status-pill" style="background:var(--border-color);color:var(--text-secondary);"><i class="bi bi-lock"></i> Belum Dibuka</span>';
+    return `
+      <div class="card-simtu session-card ${cls}">
+        <div class="d-flex justify-content-between align-items-start">
+          <div>
+            <strong>${s.label}</strong>
+            <div class="small text-muted-simtu">${s.mulai} - ${s.selesai} WIB</div>
           </div>
-          ${st === 'aktif' ? `<button class="btn btn-sm btn-primary mt-2" onclick="navigateStaf('laporan')"><i class="bi bi-camera"></i> Isi Laporan Sekarang</button>` : ''}
-        </div>`;
-    }).join('');
+          ${pill}
+        </div>
+        ${st === 'aktif' ? `<button class="btn btn-sm btn-primary mt-2" onclick="navigateStaf('laporan')"><i class="bi bi-camera"></i> Isi Laporan Sekarang</button>` : ''}
+      </div>`;
+  }).join('');
 
-    el.innerHTML = `
-      <div class="card-simtu" style="background:var(--accent-light);border:none;">
-        <strong>${AppState.user.Nama}</strong>
-        <div class="small text-muted-simtu">NIP. ${AppState.user.NIP} &middot; ${AppState.user.BidangTugas || '-'}</div>
-      </div>
-      <h6 class="mb-2">Siklus Laporan Harian</h6>
-      <div class="small text-muted-simtu mb-2">${hariLabel}</div>
-      ${cardsHtml}
-      <div class="card-simtu">
-        <strong>Riwayat Laporan Hari Ini</strong>
-        <div class="mt-2">${renderDaftarRiwayat()}</div>
-      </div>
-    `;
-  });
+  el.innerHTML = `
+    <div class="card-simtu" style="background:var(--accent-light);border:none;">
+      <strong>${AppState.user.Nama}</strong>
+      <div class="small text-muted-simtu">NIP. ${AppState.user.NIP} &middot; ${AppState.user.BidangTugas || '-'}</div>
+    </div>
+    <h6 class="mb-2">Siklus Laporan Harian</h6>
+    <div class="small text-muted-simtu mb-2">${hariLabel}</div>
+    ${cardsHtml}
+    <div class="card-simtu">
+      <strong>Riwayat Laporan Hari Ini</strong>
+      <div class="mt-2">${renderDaftarRiwayat()}</div>
+    </div>
+  `;
 }
 
 function renderDaftarRiwayat() {
@@ -367,24 +445,22 @@ function ambilLokasiDanValidasi() {
     AppState.gpsCapture.lat = pos.coords.latitude;
     AppState.gpsCapture.lng = pos.coords.longitude;
     cekRadiusGPS(pos.coords.latitude, pos.coords.longitude)
-    .then(res => {
+      .then(res => {
         const box = document.getElementById('gpsBannerBox');
         const txt = document.getElementById('gpsBannerText');
         if (!box) return;
-        if (res.success && res.data.valid) {
+        if (res && res.success && res.data.valid) {
           box.className = 'gps-banner gps-ok';
           txt.textContent = `Dalam radius sekolah (${res.data.jarak}m dari titik pusat)`;
           AppState.gpsCapture.valid = true;
         } else {
           box.className = 'gps-banner gps-fail';
-          txt.textContent = `Di luar radius sekolah (${res.data ? res.data.jarak : '?'}m). Mendekatlah ke area sekolah.`;
+          txt.textContent = `Di luar radius sekolah (${res && res.data ? res.data.jarak : '?'}m). Mendekatlah ke area sekolah.`;
           AppState.gpsCapture.valid = false;
         }
         evaluasiTombolKirim();
       })
-    .catch(x => {
-        document.getElementById('gpsBannerText').textContent = 'Gagal memvalidasi lokasi ke server.';
-      });
+      .catch(() => { document.getElementById('gpsBannerText').textContent = 'Gagal memvalidasi lokasi ke server.'; });
   }, () => {
     const box = document.getElementById('gpsBannerBox');
     if (box) { box.className = 'gps-banner gps-fail'; document.getElementById('gpsBannerText').textContent = 'Izin lokasi ditolak. Aktifkan GPS untuk melapor.'; }
@@ -431,6 +507,8 @@ function compressImage(file, maxDim, quality, callback) {
   reader.readAsDataURL(file);
 }
 
+// Optimistic: begitu server konfirmasi berhasil, LANGSUNG push ke cache lokal
+// dan tampilkan hasilnya — tidak fetch ulang daftar riwayat ke server.
 function submitLaporanPekerjaan(sesi) {
   const keterangan = document.getElementById('keteranganLaporan').value.trim();
   if (keterangan.length < 10) { showToast('Peringatan', 'Keterangan minimal 10 karakter.', 'warning'); return; }
@@ -440,14 +518,18 @@ function submitLaporanPekerjaan(sesi) {
   setBtnLoading(btn, 'Mengirim...');
 
   kirimLaporanPekerjaan({
-      nip: AppState.user.NIP, nama: AppState.user.Nama, sesi,
-      keterangan, lat: AppState.gpsCapture.lat, lng: AppState.gpsCapture.lng,
-      fotoBase64: AppState.fotoCapture.base64, mimeType: AppState.fotoCapture.mime, fileName: AppState.fotoCapture.fileName
-    })
+    nip: AppState.user.NIP, nama: AppState.user.Nama, sesi,
+    keterangan, lat: AppState.gpsCapture.lat, lng: AppState.gpsCapture.lng,
+    fotoBase64: AppState.fotoCapture.base64, mimeType: AppState.fotoCapture.mime, fileName: AppState.fotoCapture.fileName
+  })
     .then(res => {
+      if (!res) { resetBtn(btn, '<i class="bi bi-send"></i> Kirim Laporan Sesi ' + sesi); showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
       if (res.success) {
         showToast('Berhasil', res.message, 'success');
-        navigateStaf('presensi');
+        // ✅ Optimistic: langsung masukkan ke cache, tanpa fetch ulang ke server.
+        AppState.riwayatHariIni.push(res.data);
+        persistCurrentCache();
+        navigateStaf('presensi'); // instan, dari cache yang baru diupdate
       } else {
         resetBtn(btn, '<i class="bi bi-send"></i> Kirim Laporan Sesi ' + sesi);
         showToast('Gagal', res.message, 'danger');
@@ -483,30 +565,24 @@ function renderStafIzin() {
     </div>
     <div class="card-simtu">
       <strong>Riwayat Pengajuan Izin</strong>
-      <div id="riwayatIzinStaf" class="mt-2"><div class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div></div></div>
+      <div class="mt-2">${renderDaftarRiwayatIzinStaf()}</div>
     </div>
   `;
-  getAllLaporanIzin()
-    .then(res => {
-      const box = document.getElementById('riwayatIzinStaf');
-      if (!res || !res.success) { box.innerHTML = `<div class="small text-danger">Gagal memuat riwayat: ${res ? res.message : 'Respons kosong dari server.'}</div>`; return; }
-      const list = (res.data || []).filter(r => String(r.NIP) === String(AppState.user.NIP)).reverse();
-      if (!list.length) { box.innerHTML = '<div class="small text-muted-simtu">Belum ada riwayat izin.</div>'; return; }
-      box.innerHTML = list.map(r => {
-        const pill = r.StatusValidasi === 'Disetujui' ? 'status-success' : r.StatusValidasi === 'Ditolak' ? 'status-danger' : 'status-warning';
-        return `<div class="d-flex justify-content-between align-items-start mb-2 pb-2" style="border-bottom:1px solid var(--border-color);">
-          <div>
-            <div class="small fw-bold">${r.KategoriIzin || 'Izin'} &middot; ${formatTanggalIndo(r.Tanggal)}</div>
-            <div class="small text-muted-simtu">${r.Keterangan || '-'}</div>
-          </div>
-          <span class="status-pill ${pill}">${r.StatusValidasi}</span>
-        </div>`;
-      }).join('');
-    })
-    .catch(err => {
-      const box = document.getElementById('riwayatIzinStaf');
-      if (box) box.innerHTML = `<div class="small text-danger">Gagal memuat riwayat: ${err.message}</div>`;
-    });
+}
+
+function renderDaftarRiwayatIzinStaf() {
+  const list = (AppState.riwayatIzinStaf || []).slice().reverse();
+  if (!list.length) return '<div class="small text-muted-simtu">Belum ada riwayat izin.</div>';
+  return list.map(r => {
+    const pill = r.StatusValidasi === 'Disetujui' ? 'status-success' : r.StatusValidasi === 'Ditolak' ? 'status-danger' : 'status-warning';
+    return `<div class="d-flex justify-content-between align-items-start mb-2 pb-2" style="border-bottom:1px solid var(--border-color);">
+      <div>
+        <div class="small fw-bold">${r.KategoriIzin || 'Izin'} &middot; ${formatTanggalIndo(r.Tanggal)}</div>
+        <div class="small text-muted-simtu">${r.Keterangan || '-'}</div>
+      </div>
+      <span class="status-pill ${pill}">${r.StatusValidasi}</span>
+    </div>`;
+  }).join('');
 }
 
 function evaluasiTombolKirimIzin() {
@@ -524,13 +600,19 @@ function submitLaporanIzin() {
   const btn = document.getElementById('btnKirimIzin');
   setBtnLoading(btn, 'Mengirim...');
   kirimLaporanIzin({
-      nip: AppState.user.NIP, nama: AppState.user.Nama, kategori, keterangan,
-      fotoBase64: AppState.izinFoto.base64, mimeType: AppState.izinFoto.mime, fileName: AppState.izinFoto.fileName
-    })
+    nip: AppState.user.NIP, nama: AppState.user.Nama, kategori, keterangan,
+    fotoBase64: AppState.izinFoto.base64, mimeType: AppState.izinFoto.mime, fileName: AppState.izinFoto.fileName
+  })
     .then(res => {
-      resetBtn(btn, '<i class="bi bi-send"></i> Kirim Pengajuan Izin');
-      if (res.success) { showToast('Terkirim', res.message, 'success'); navigateStaf('izin'); }
-      else showToast('Gagal', res.message, 'danger');
+      if (!res) { resetBtn(btn, '<i class="bi bi-send"></i> Kirim Pengajuan Izin'); showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
+      if (res.success) {
+        showToast('Terkirim', res.message, 'success');
+        AppState.riwayatIzinStaf.push(res.data); // ✅ optimistic, tanpa fetch ulang
+        persistCurrentCache();
+        navigateStaf('izin');
+      } else {
+        resetBtn(btn, '<i class="bi bi-send"></i> Kirim Pengajuan Izin'); showToast('Gagal', res.message, 'danger');
+      }
     })
     .catch(err => { resetBtn(btn, '<i class="bi bi-send"></i> Kirim Pengajuan Izin'); showToast('Error', err.message, 'danger'); });
 }
@@ -557,7 +639,7 @@ function renderStafProfil() {
 }
 
 // ════════════════════════════════════════════════════════
-// NAVIGASI ADMIN
+// NAVIGASI ADMIN — INSTAN, render dari AppState (tanpa fetch)
 // ════════════════════════════════════════════════════════
 function navigateAdmin(section) {
   document.querySelectorAll('.admin-shell .sidebar-nav .nav-link').forEach(l => l.classList.toggle('active', l.dataset.section === section));
@@ -571,44 +653,53 @@ function navigateAdmin(section) {
   else if (section === 'validasi') renderAdminValidasi();
   else if (section === 'masterStaf') renderAdminMasterStaf();
   else if (section === 'cetak') renderAdminCetak();
-  else if (section === 'pengaturan') refreshConfigThenRender(renderAdminPengaturan);
+  else if (section === 'pengaturan') renderAdminPengaturan();
 }
 
 function renderAdminDashboard() {
   const el = document.getElementById('section-dashboard');
-  el.innerHTML = `<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>`;
-  getDashboardData()
-    .then(res => {
-      if (!res.success) { el.innerHTML = `<div class="alert alert-danger">${res.message}</div>`; return; }
-      const d = res.data;
-      el.innerHTML = `
-        <div class="row g-3 mb-3">
-          <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Total Staf TU</div><div class="kpi-value">${d.totalStaf}</div></div></div>
-          <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Sudah Lapor</div><div class="kpi-value" style="color:var(--success-solid)">${d.sudahLapor}</div></div></div>
-          <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Belum Lapor</div><div class="kpi-value" style="color:var(--danger-solid)">${d.belumLapor}</div></div></div>
-          <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Izin Hari Ini</div><div class="kpi-value" style="color:var(--warning-solid)">${d.izinCount}</div></div></div>
+  const d = AppState.dashboardCache;
+  if (!d) {
+    el.innerHTML = `<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="small text-muted-simtu mt-2">Memuat data dashboard...</p></div>`;
+    muatUlangDashboard();
+    return;
+  }
+  el.innerHTML = `
+    <div class="d-flex justify-content-end mb-2">
+      <button class="btn btn-sm btn-outline-secondary" onclick="muatUlangDashboard()"><i class="bi bi-arrow-clockwise"></i> Segarkan</button>
+    </div>
+    <div class="row g-3 mb-3">
+      <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Total Staf TU</div><div class="kpi-value">${d.totalStaf}</div></div></div>
+      <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Sudah Lapor</div><div class="kpi-value" style="color:var(--success-solid)">${d.sudahLapor}</div></div></div>
+      <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Belum Lapor</div><div class="kpi-value" style="color:var(--danger-solid)">${d.belumLapor}</div></div></div>
+      <div class="col-6 col-lg-3"><div class="kpi-card"><div class="kpi-label">Izin Hari Ini</div><div class="kpi-value" style="color:var(--warning-solid)">${d.izinCount}</div></div></div>
+    </div>
+    <div class="row g-3 mb-3">
+      <div class="col-lg-4"><div class="kpi-card"><strong>Kepatuhan Hari Ini</strong><canvas id="chartDonut" height="200" class="mt-2"></canvas></div></div>
+      <div class="col-lg-4"><div class="kpi-card"><strong>Tren 7 Hari Terakhir</strong><canvas id="chartTren" height="200" class="mt-2"></canvas></div></div>
+      <div class="col-lg-4">
+        <div class="kpi-card mb-3"><strong><i class="bi bi-trophy text-warning"></i> Staf Paling Rajin</strong>
+          ${d.topRajin.map((r,i)=>`<div class="d-flex justify-content-between small mt-2"><span>${i+1}. ${r.nama}</span><strong>${r.jumlah}x</strong></div>`).join('') || '<div class="small text-muted-simtu mt-2">Belum ada data.</div>'}
         </div>
-        <div class="row g-3 mb-3">
-          <div class="col-lg-4"><div class="kpi-card"><strong>Kepatuhan Hari Ini</strong><canvas id="chartDonut" height="200" class="mt-2"></canvas></div></div>
-          <div class="col-lg-4"><div class="kpi-card"><strong>Tren 7 Hari Terakhir</strong><canvas id="chartTren" height="200" class="mt-2"></canvas></div></div>
-          <div class="col-lg-4">
-            <div class="kpi-card mb-3"><strong><i class="bi bi-trophy text-warning"></i> Staf Paling Rajin</strong>
-              ${d.topRajin.map((r,i)=>`<div class="d-flex justify-content-between small mt-2"><span>${i+1}. ${r.nama}</span><strong>${r.jumlah}x</strong></div>`).join('') || '<div class="small text-muted-simtu mt-2">Belum ada data.</div>'}
-            </div>
-            <div class="kpi-card"><strong><i class="bi bi-calendar-x text-danger"></i> Paling Sering Izin</strong>
-              ${d.topIzin.map((r,i)=>`<div class="d-flex justify-content-between small mt-2"><span>${i+1}. ${r.nama}</span><strong>${r.jumlah}x</strong></div>`).join('') || '<div class="small text-muted-simtu mt-2">Belum ada data.</div>'}
-            </div>
-          </div>
+        <div class="kpi-card"><strong><i class="bi bi-calendar-x text-danger"></i> Paling Sering Izin</strong>
+          ${d.topIzin.map((r,i)=>`<div class="d-flex justify-content-between small mt-2"><span>${i+1}. ${r.nama}</span><strong>${r.jumlah}x</strong></div>`).join('') || '<div class="small text-muted-simtu mt-2">Belum ada data.</div>'}
         </div>
-        <div class="kpi-card">
-          <strong><i class="bi bi-lightbulb text-warning"></i> Ringkasan Otomatis</strong>
-          <ul class="mt-2 mb-0 small">${d.insights.map(i => `<li>${i}</li>`).join('')}</ul>
-        </div>
-      `;
-      renderChartDonut(d);
-      renderChartTren(d.tren);
-    })
-    .catch(err => { el.innerHTML = `<div class="alert alert-danger">${err.message}</div>`; });
+      </div>
+    </div>
+    <div class="kpi-card">
+      <strong><i class="bi bi-lightbulb text-warning"></i> Ringkasan Otomatis</strong>
+      <ul class="mt-2 mb-0 small">${d.insights.map(i => `<li>${i}</li>`).join('')}</ul>
+    </div>
+  `;
+  renderChartDonut(d);
+  renderChartTren(d.tren);
+}
+
+function muatUlangDashboard() {
+  getDashboardData().then(res => {
+    if (res && res.success) { AppState.dashboardCache = res.data; persistCurrentCache(); }
+    renderAdminDashboard();
+  }).catch(err => showToast('Gagal', 'Gagal menyegarkan dashboard: ' + err.message, 'danger'));
 }
 
 function renderChartDonut(d) {
@@ -632,73 +723,87 @@ function renderChartTren(tren) {
   });
 }
 
-// ── Validasi Izin ──
+// ── Validasi Izin — optimistic update ──
 function renderAdminValidasi() {
   const el = document.getElementById('section-validasi');
-  el.innerHTML = `<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>`;
-  getAllLaporanIzin()
-    .then(res => {
-      if (!res || !res.success) {
-        el.innerHTML = `<div class="alert alert-danger">Gagal memuat data izin: ${res ? res.message : 'Respons kosong dari server.'}</div>`;
-        return;
-      }
-      AppState.dataIzinCache = res.data || [];
-      const pending = AppState.dataIzinCache.filter(r => r.StatusValidasi === 'Menunggu Validasi');
-      const sudahDiproses = AppState.dataIzinCache.filter(r => r.StatusValidasi !== 'Menunggu Validasi');
-      const badge = document.getElementById('badgeIzin');
-      if (pending.length) { badge.style.display = 'inline-block'; badge.textContent = pending.length; } else { badge.style.display = 'none'; }
+  const pending = AppState.dataIzinCache.filter(r => r.StatusValidasi === 'Menunggu Validasi');
+  const sudahDiproses = AppState.dataIzinCache.filter(r => r.StatusValidasi !== 'Menunggu Validasi');
+  const badge = document.getElementById('badgeIzin');
+  if (pending.length) { badge.style.display = 'inline-block'; badge.textContent = pending.length; } else { badge.style.display = 'none'; }
 
-      const kartuPending = pending.map(r => `
-        <div class="col-md-6">
-          <div class="kpi-card">
-            <div class="d-flex justify-content-between"><strong>${r.Nama}</strong><span class="status-pill status-warning">Menunggu</span></div>
-            <div class="small text-muted-simtu mb-1">NIP ${r.NIP} &middot; ${formatTanggalIndo(r.Tanggal)}</div>
-            <div class="small fw-bold mb-2">${r.KategoriIzin || 'Izin'}: <span class="fw-normal">${r.Keterangan || '-'}</span></div>
-            <img src="${r.FotoURL}" class="img-fluid rounded mb-2" style="max-height:180px;cursor:pointer;" onclick="previewFoto('${r.FotoURL}','Surat Izin ${r.Nama}')">
-            <div class="d-flex gap-2">
-              <button class="btn btn-success btn-sm flex-fill" onclick="prosesValidasiIzin('${r.ID}','Disetujui')"><i class="bi bi-check"></i> Setujui</button>
-              <button class="btn btn-outline-danger btn-sm flex-fill" onclick="prosesValidasiIzin('${r.ID}','Ditolak')"><i class="bi bi-x"></i> Tolak</button>
-            </div>
-          </div>
-        </div>`).join('');
-
-      const barisRiwayat = sudahDiproses.slice().reverse().map(r => {
-        const pill = r.StatusValidasi === 'Disetujui' ? 'status-success' : 'status-danger';
-        return `<tr>
-          <td>${formatTanggalIndo(r.Tanggal)}</td><td>${r.Nama}</td><td>${r.KategoriIzin || '-'}</td>
-          <td>${r.Keterangan || '-'}</td><td><span class="status-pill ${pill}">${r.StatusValidasi}</span></td>
-          <td><img src="${r.FotoURL}" class="thumb-foto" onclick="previewFoto('${r.FotoURL}','Surat Izin ${r.Nama}')"></td>
-        </tr>`;
-      }).join('');
-
-      el.innerHTML = `
-        <h6 class="mb-2">Menunggu Validasi (${pending.length})</h6>
-        ${pending.length ? `<div class="row g-3 mb-4">${kartuPending}</div>` : `<div class="kpi-card text-center py-4 mb-4"><i class="bi bi-check-circle fs-1 text-success"></i><p class="mt-2 text-muted-simtu mb-0">Tidak ada pengajuan izin menunggu validasi.</p></div>`}
-        <h6 class="mb-2">Riwayat Izin Sudah Divalidasi</h6>
-        <div class="kpi-card" style="overflow-x:auto;">
-          <table class="table-simtu">
-            <thead><tr><th>Tanggal</th><th>Nama</th><th>Kategori</th><th>Keterangan</th><th>Status</th><th>Foto</th></tr></thead>
-            <tbody>${barisRiwayat || '<tr><td colspan="6" class="text-center small text-muted-simtu py-3">Belum ada riwayat.</td></tr>'}</tbody>
-          </table>
+  const kartuPending = pending.map(r => `
+    <div class="col-md-6">
+      <div class="kpi-card">
+        <div class="d-flex justify-content-between"><strong>${r.Nama}</strong><span class="status-pill status-warning">Menunggu</span></div>
+        <div class="small text-muted-simtu mb-1">NIP ${r.NIP} &middot; ${formatTanggalIndo(r.Tanggal)}</div>
+        <div class="small fw-bold mb-2">${r.KategoriIzin || 'Izin'}: <span class="fw-normal">${r.Keterangan || '-'}</span></div>
+        <img src="${r.FotoURL}" class="img-fluid rounded mb-2" style="max-height:180px;cursor:pointer;" onclick="previewFoto('${r.FotoURL}','Surat Izin ${r.Nama}')">
+        <div class="d-flex gap-2">
+          <button class="btn btn-success btn-sm flex-fill" onclick="prosesValidasiIzin('${r.ID}','Disetujui')"><i class="bi bi-check"></i> Setujui</button>
+          <button class="btn btn-outline-danger btn-sm flex-fill" onclick="prosesValidasiIzin('${r.ID}','Ditolak')"><i class="bi bi-x"></i> Tolak</button>
         </div>
-      `;
-    })
-    .catch(err => { el.innerHTML = `<div class="alert alert-danger">Gagal memuat data izin: ${err.message}</div>`; });
+      </div>
+    </div>`).join('');
+
+  const barisRiwayat = sudahDiproses.slice().reverse().map(r => {
+    const pill = r.StatusValidasi === 'Disetujui' ? 'status-success' : 'status-danger';
+    return `<tr>
+      <td>${formatTanggalIndo(r.Tanggal)}</td><td>${r.Nama}</td><td>${r.KategoriIzin || '-'}</td>
+      <td>${r.Keterangan || '-'}</td><td><span class="status-pill ${pill}">${r.StatusValidasi}</span></td>
+      <td><img src="${r.FotoURL}" class="thumb-foto" onclick="previewFoto('${r.FotoURL}','Surat Izin ${r.Nama}')"></td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <h6 class="mb-2">Menunggu Validasi (${pending.length})</h6>
+    ${pending.length ? `<div class="row g-3 mb-4">${kartuPending}</div>` : `<div class="kpi-card text-center py-4 mb-4"><i class="bi bi-check-circle fs-1 text-success"></i><p class="mt-2 text-muted-simtu mb-0">Tidak ada pengajuan izin menunggu validasi.</p></div>`}
+    <h6 class="mb-2">Riwayat Izin Sudah Divalidasi</h6>
+    <div class="kpi-card" style="overflow-x:auto;">
+      <table class="table-simtu">
+        <thead><tr><th>Tanggal</th><th>Nama</th><th>Kategori</th><th>Keterangan</th><th>Status</th><th>Foto</th></tr></thead>
+        <tbody>${barisRiwayat || '<tr><td colspan="6" class="text-center small text-muted-simtu py-3">Belum ada riwayat.</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 function prosesValidasiIzin(id, status) {
+  // ✅ Optimistic: update status di cache & re-render INSTAN dulu.
+  const idx = AppState.dataIzinCache.findIndex(r => r.ID === id);
+  if (idx === -1) return;
+  const backup = Object.assign({}, AppState.dataIzinCache[idx]);
+  AppState.dataIzinCache[idx].StatusValidasi = status;
+  AppState.dataIzinCache[idx].DivalidasiOleh = AppState.user.Nama;
+  renderAdminValidasi();
+  persistCurrentCache();
+
   validasiIzin(id, status, AppState.user.Nama)
-    .then(res => { showToast(res.success ? 'Berhasil' : 'Gagal', res.message, res.success ? 'success' : 'danger'); renderAdminValidasi(); })
-    .catch(err => { showToast('Error', err.message, 'danger'); });
+    .then(res => {
+      if (!res || !res.success) {
+        AppState.dataIzinCache[idx] = backup; // rollback
+        renderAdminValidasi();
+        persistCurrentCache();
+        showToast('Gagal', res ? res.message : 'Respons kosong dari server.', 'danger');
+      } else {
+        showToast('Berhasil', res.message, 'success');
+      }
+    })
+    .catch(err => {
+      AppState.dataIzinCache[idx] = backup; // rollback
+      renderAdminValidasi();
+      persistCurrentCache();
+      showToast('Error', err.message, 'danger');
+    });
 }
 
-// ── Master Data Staf ──
+// ── Master Data Staf — render dari cache, CRUD optimistic ──
 function renderAdminMasterStaf() {
   const el = document.getElementById('section-masterStaf');
   el.innerHTML = `
     <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
       <input type="text" class="form-control" style="max-width:280px;" placeholder="Cari nama atau NIP..." id="searchStaf" oninput="filterTabelStaf()">
       <div class="d-flex gap-2">
+        <button class="btn btn-outline-secondary btn-sm" onclick="muatUlangDataStaf()"><i class="bi bi-arrow-clockwise"></i></button>
         <input type="file" id="inputImportExcel" accept=".xlsx,.xls,.csv" style="display:none;" onchange="handleImportExcel(event)">
         <button class="btn btn-outline-primary btn-sm" onclick="document.getElementById('inputImportExcel').click()"><i class="bi bi-file-earmark-excel"></i> Import Excel</button>
         <button class="btn btn-primary btn-sm" onclick="showFormTambahStaf()"><i class="bi bi-person-plus"></i> Tambah Staf</button>
@@ -708,31 +813,23 @@ function renderAdminMasterStaf() {
     <div class="kpi-card" style="overflow-x:auto;">
       <table class="table-simtu" id="tabelStaf">
         <thead><tr><th>Nama</th><th>NIP</th><th>Bidang Tugas</th><th>Status</th><th>Aksi</th></tr></thead>
-        <tbody><tr><td colspan="5" class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div></td></tr></tbody>
+        <tbody></tbody>
       </table>
     </div>
   `;
-  loadDataStaf();
+  renderTabelStaf(AppState.dataStafCache);
 }
 
-function loadDataStaf() {
-  const tbody = document.querySelector('#tabelStaf tbody');
-  getAllData('DataStaf')
-    .then(res => {
-      if (!res || !res.success) {
-        if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="text-center small text-danger py-3">Gagal memuat data staf: ${res ? res.message : 'Respons kosong dari server.'}</td></tr>`;
-        return;
-      }
-      AppState.dataStafCache = res.data || [];
-      renderTabelStaf(AppState.dataStafCache);
-    })
-    .catch(err => {
-      if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="text-center small text-danger py-3">Gagal memuat data staf: ${err.message}</td></tr>`;
-    });
+function muatUlangDataStaf() {
+  getAllData('DataStaf').then(res => {
+    if (res && res.success) { AppState.dataStafCache = res.data || []; persistCurrentCache(); renderTabelStaf(AppState.dataStafCache); }
+    else showToast('Gagal', res ? res.message : 'Respons kosong dari server.', 'danger');
+  }).catch(err => showToast('Gagal', err.message, 'danger'));
 }
 
 function renderTabelStaf(list) {
   const tbody = document.querySelector('#tabelStaf tbody');
+  if (!tbody) return;
   if (!list.length) { tbody.innerHTML = '<tr><td colspan="5" class="text-center small text-muted-simtu py-3">Belum ada data staf.</td></tr>'; return; }
   tbody.innerHTML = list.map(s => `
     <tr>
@@ -770,22 +867,50 @@ function editStaf(s) { showFormTambahStaf(s); }
 function simpanStaf(id) {
   const record = { Nama: document.getElementById('fNama').value.trim(), NIP: document.getElementById('fNIP').value.trim(), BidangTugas: document.getElementById('fBidang').value.trim() };
   if (!record.Nama || !record.NIP) { showToast('Peringatan', 'Nama dan NIP wajib diisi.', 'warning'); return; }
-  const action = id ? 'updateRecord' : 'addRecord';
-  if (id) record.ID = id;
-  window[action]('DataStaf', record)
-    .then(res => {
-      if (!res) { showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
-      showToast(res.success ? 'Berhasil' : 'Gagal', res.message, res.success ? 'success' : 'danger');
-      if (res.success) { document.getElementById('formStafContainer').innerHTML = ''; loadDataStaf(); }
-    })
-    .catch(err => { showToast('Error', err.message, 'danger'); });
+  const isEdit = !!id;
+  if (isEdit) record.ID = id;
+
+  const call = isEdit ? updateRecord('DataStaf', record) : addRecord('DataStaf', record);
+  call.then(res => {
+    if (!res) { showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
+    if (!res.success) { showToast('Gagal', res.message, 'danger'); return; }
+    showToast('Berhasil', res.message, 'success');
+    // ✅ Optimistic: update cache langsung, tanpa fetch ulang seluruh tabel.
+    if (isEdit) {
+      const idx = AppState.dataStafCache.findIndex(s => s.ID === id);
+      if (idx !== -1) AppState.dataStafCache[idx] = Object.assign({}, AppState.dataStafCache[idx], res.data);
+    } else {
+      AppState.dataStafCache.push(res.data);
+    }
+    persistCurrentCache();
+    document.getElementById('formStafContainer').innerHTML = '';
+    renderTabelStaf(AppState.dataStafCache);
+  }).catch(err => showToast('Error', err.message, 'danger'));
 }
 
 function hapusStaf(id, nama) {
   confirmAction('Hapus Staf', `Hapus data staf "${nama}"? Tindakan ini tidak dapat dibatalkan.`, () => {
-    deleteRecord('DataStaf', id)
-    .then(res => { if (!res) { showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; } showToast(res.success ? 'Berhasil' : 'Gagal', res.message, res.success ? 'success' : 'danger'); loadDataStaf(); })
-    .catch(err => { showToast('Error', err.message, 'danger'); });
+    // ✅ Optimistic: hilang dari tabel dulu, baru sinkron ke server.
+    const backupList = AppState.dataStafCache.slice();
+    AppState.dataStafCache = AppState.dataStafCache.filter(s => s.ID !== id);
+    renderTabelStaf(AppState.dataStafCache);
+    persistCurrentCache();
+
+    deleteRecord('DataStaf', id).then(res => {
+      if (!res || !res.success) {
+        AppState.dataStafCache = backupList; // rollback
+        renderTabelStaf(AppState.dataStafCache);
+        persistCurrentCache();
+        showToast('Gagal', res ? res.message : 'Respons kosong dari server.', 'danger');
+      } else {
+        showToast('Berhasil', res.message, 'success');
+      }
+    }).catch(err => {
+      AppState.dataStafCache = backupList; // rollback
+      renderTabelStaf(AppState.dataStafCache);
+      persistCurrentCache();
+      showToast('Error', err.message, 'danger');
+    });
   });
 }
 
@@ -798,21 +923,22 @@ function handleImportExcel(event) {
     const records = rows.map(r => ({ Nama: r.Nama || r.NAMA || r.nama, NIP: r.NIP || r.nip, BidangTugas: r.BidangTugas || r['Bidang Tugas'] || r.bidangtugas || '' }));
     if (!records.length) { showToast('Peringatan', 'File Excel kosong atau format kolom tidak sesuai (Nama, NIP, BidangTugas).', 'warning'); return; }
     importStafBatch(records)
-    .then(res => {
+      .then(res => {
         if (!res) { showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
         showToast(res.success ? 'Import Selesai' : 'Gagal', res.message, res.success ? 'success' : 'danger');
-        loadDataStaf();
+        if (res.success && res.data && res.data.stafBaru) {
+          AppState.dataStafCache = AppState.dataStafCache.concat(res.data.stafBaru); // ✅ optimistic
+          persistCurrentCache();
+          renderTabelStaf(AppState.dataStafCache);
+        }
       })
-    .catch(err => { showToast('Error', err.message, 'danger'); });
+      .catch(err => showToast('Error', err.message, 'danger'));
   };
   reader.readAsArrayBuffer(file);
   event.target.value = '';
 }
 
-// ── Laporan Staf TU (dulu "Cetak / Ekspor Laporan") ──
-// Begitu halaman dibuka, data laporan HARI INI langsung tampil otomatis
-// (tanpa perlu klik tombol) — tombol "Tampilkan" hanya dipakai jika admin
-// ingin mengganti rentang tanggal/filter staf.
+// ── Laporan Staf TU — hari ini langsung dari cache, rentang lain fetch ──
 function renderAdminCetak() {
   const el = document.getElementById('section-cetak');
   const today = new Date().toISOString().slice(0, 10);
@@ -840,48 +966,49 @@ function renderAdminCetak() {
     <div class="kpi-card mt-3" style="overflow-x:auto;">
       <table class="table-simtu" id="tabelRekap">
         <thead><tr><th>Foto</th><th>Tanggal</th><th>NIP</th><th>Nama</th><th>Sesi</th><th>Jam</th><th>Status</th><th>Keterangan</th></tr></thead>
-        <tbody><tr><td colspan="8" class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div></td></tr></tbody>
+        <tbody></tbody>
       </table>
     </div>
   `;
+  // ✅ Instan: tanggal default = hari ini, datanya SUDAH ada dari bootstrap, tidak fetch.
+  AppState.rekapCache = AppState.laporanHariIniCache;
+  renderBarisRekap(AppState.rekapCache);
+}
 
-  // Langsung tampilkan laporan hari ini tanpa menunggu klik.
-  muatRekap();
-
-  if (!AppState.dataStafCache.length) {
-    getAllData('DataStaf')
-    .then(res => {
-        if (res && res.success) {
-          AppState.dataStafCache = res.data || [];
-          const sel = document.getElementById('rekapNIP');
-          if (sel) sel.innerHTML = '<option value="">Semua Staf</option>' + AppState.dataStafCache.map(s => `<option value="${s.NIP}">${s.Nama}</option>`).join('');
-        }
-      })
-    .catch(x => { showToast('Peringatan', 'Gagal memuat daftar staf untuk filter.', 'warning'); });
-  }
+function renderBarisRekap(data) {
+  const tbody = document.querySelector('#tabelRekap tbody');
+  if (!tbody) return;
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="8" class="text-center small text-muted-simtu py-3">Tidak ada data pada rentang ini.</td></tr>'; return; }
+  tbody.innerHTML = data.map(r => `<tr>
+    <td><img src="${r.FotoURL}" class="thumb-foto" onclick="previewFoto('${r.FotoURL}','Laporan ${r.Nama} - Sesi ${r.Sesi}')"></td>
+    <td>${r.Tanggal}</td><td>${r.NIP}</td><td>${r.Nama}</td><td>${r.Sesi}</td><td>${r.JamLapor}</td>
+    <td><span class="status-pill ${r.Status === 'Tepat Waktu' ? 'status-success' : 'status-warning'}">${r.Status}</span></td>
+    <td>${r.Keterangan}</td>
+  </tr>`).join('');
 }
 
 function muatRekap() {
   const awal = document.getElementById('rekapAwal').value, akhir = document.getElementById('rekapAkhir').value, nip = document.getElementById('rekapNIP').value;
+  const today = new Date().toISOString().slice(0, 10);
+  // Kasus paling umum (hari ini, semua staf) sudah ada di cache — instan tanpa fetch.
+  if (awal === today && akhir === today && !nip) {
+    AppState.rekapCache = AppState.laporanHariIniCache;
+    renderBarisRekap(AppState.rekapCache);
+    return;
+  }
   const tbody = document.querySelector('#tabelRekap tbody');
   tbody.innerHTML = '<tr><td colspan="8" class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div></td></tr>';
   getRekapLaporan('custom', awal, akhir, nip)
     .then(res => {
       if (!res || !res.success) { tbody.innerHTML = `<tr><td colspan="8" class="text-center small text-danger py-3">Gagal memuat rekap: ${res ? res.message : 'Respons kosong dari server.'}</td></tr>`; return; }
       AppState.rekapCache = res.data || [];
-      if (!res.data.length) { tbody.innerHTML = '<tr><td colspan="8" class="text-center small text-muted-simtu py-3">Tidak ada data pada rentang ini.</td></tr>'; return; }
-      tbody.innerHTML = res.data.map(r => `<tr>
-        <td><img src="${r.FotoURL}" class="thumb-foto" onclick="previewFoto('${r.FotoURL}','Laporan ${r.Nama} - Sesi ${r.Sesi}')"></td>
-        <td>${r.Tanggal}</td><td>${r.NIP}</td><td>${r.Nama}</td><td>${r.Sesi}</td><td>${r.JamLapor}</td>
-        <td><span class="status-pill ${r.Status === 'Tepat Waktu' ? 'status-success' : 'status-warning'}">${r.Status}</span></td>
-        <td>${r.Keterangan}</td>
-      </tr>`).join('');
+      renderBarisRekap(AppState.rekapCache);
     })
     .catch(err => { tbody.innerHTML = `<tr><td colspan="8" class="text-center small text-danger py-3">Gagal memuat rekap: ${err.message}</td></tr>`; });
 }
 
 function eksporPDF() {
-  if (!AppState.rekapCache || !AppState.rekapCache.length) { showToast('Peringatan', 'Tampilkan data rekap terlebih dahulu.', 'warning'); return; }
+  if (!AppState.rekapCache || !AppState.rekapCache.length) { showToast('Peringatan', 'Tidak ada data untuk diekspor.', 'warning'); return; }
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF();
   doc.setFontSize(14); doc.text('Rekapitulasi Laporan Kinerja Staf TU', 14, 15);
@@ -896,14 +1023,14 @@ function eksporPDF() {
 }
 
 function eksporExcel() {
-  if (!AppState.rekapCache || !AppState.rekapCache.length) { showToast('Peringatan', 'Tampilkan data rekap terlebih dahulu.', 'warning'); return; }
+  if (!AppState.rekapCache || !AppState.rekapCache.length) { showToast('Peringatan', 'Tidak ada data untuk diekspor.', 'warning'); return; }
   const ws = XLSX.utils.json_to_sheet(AppState.rekapCache);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Rekap Laporan');
   XLSX.writeFile(wb, 'Rekap_Laporan_SIMTU.xlsx');
 }
 
-// ── Pengaturan ──
+// ── Pengaturan — render dari cache (tidak fetch saat buka menu) ──
 function renderAdminPengaturan() {
   const el = document.getElementById('section-pengaturan');
   const c = AppState.config;
@@ -966,8 +1093,12 @@ function simpanPengaturan() {
   setConfigBatch(payload)
     .then(res => {
       resetBtn(btn, '<i class="bi bi-save"></i> Simpan Semua Perubahan');
+      if (!res) { showToast('Gagal', 'Respons kosong dari server.', 'danger'); return; }
       showToast(res.success ? 'Tersimpan' : 'Gagal', res.message, res.success ? 'success' : 'danger');
-      if (res.success) Object.assign(AppState.config, payload);
+      if (res.success) {
+        Object.assign(AppState.config, payload); // ✅ optimistic, langsung update cache
+        persistCurrentCache();
+      }
     })
     .catch(err => { resetBtn(btn, '<i class="bi bi-save"></i> Simpan Semua Perubahan'); showToast('Error', err.message, 'danger'); });
 }

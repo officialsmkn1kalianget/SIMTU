@@ -60,3 +60,7 @@ function setConfigBatch(configObj) { return apiPost('setConfigBatch', configObj)
 // ── Dashboard & Rekap ──
 function getDashboardData() { return apiGet('getDashboardData'); }
 function getRekapLaporan(periode, awal, akhir, nip) { return apiGet('getRekapLaporan', { periode: periode || '', awal: awal || '', akhir: akhir || '', nip: nip || '' }); }
+
+// ── Bootstrap (gas-instant-ux): satu panggilan ambil semua data awal ──
+function getBootstrapAdmin() { return apiGet('getBootstrapAdmin'); }
+function getBootstrapStaf(nip) { return apiGet('getBootstrapStaf', { nip }); }
